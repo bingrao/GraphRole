@@ -14,21 +14,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-
 from __future__ import print_function
 
 import sys
+import networkx as nx
+import pandas as pd
+import math
 from pyspark.sql import SparkSession
 from pyspark.sql.types import StructType, StructField
 from pyspark.sql.types import DoubleType, IntegerType, StringType, LongType, DateType, FloatType
 from pyspark.sql.functions import struct
 from pyspark.sql import functions as f
-import networkx as nx
 from graphrole import RecursiveFeatureExtractor, RoleExtractor
 from datetime import timedelta
 from pyspark.sql.functions import udf
-import pandas as pd
-import math
 from numpy import linalg as la
 from pandas.compat import StringIO
 
@@ -40,10 +39,16 @@ if __name__ == "__main__":
         .builder \
         .appName("PythonPi") \
         .getOrCreate()
+    inputdata = '/data/test.csv'
+    output = '/output/dynamic.parquet'
 
-    inputdata = str(sys.argv[1]) if len(sys.argv) > 1 else '/data/test.csv'
-    print(f"[*dynamgraph*]\t the input file is {inputdata}\n")
-    schema = StructType([
+    if len(sys.argv) > 2:
+        inputdata = str(sys.argv[1])
+        output = str(sys.argv[2])
+
+    print(f"[*dynamgraph*]\tthe input file is {inputdata}, the output file: {output}.\n")
+
+    inputschema = StructType([
         StructField("model", StringType()),
         StructField("date", DateType()),
         StructField("wSize", IntegerType()),
@@ -63,7 +68,7 @@ if __name__ == "__main__":
     # | -- srcid: long(nullable=true)
     # | -- dstid: long(nullable=true)
     df = spark.read \
-        .load(inputdata, format="csv", sep="\t", schema=schema, header="true") \
+        .load(inputdata, format="csv", sep="\t", schema=inputschema, header="true") \
         .dropna()  # Remove unvalid data
     # https://stackoverflow.com/questions/44067861/pyspark-add-a-new-column-with-a-tuple-created-from-columns?noredirect=1&lq=1
     # https://stackoverflow.com/questions/33681487/how-do-i-add-a-new-column-to-a-spark-dataframe-using-pyspark
@@ -91,7 +96,7 @@ if __name__ == "__main__":
         .agg(f.collect_list("edge").alias("edges")) \
         .select("model", "date", "edges")
 
-    df_edgeslist = df_edgeslist.sample(0.3, 10)  # debug statement
+    # df_edgeslist = df_edgeslist.sample(0.3, 10)  # debug statement
 
     def getdataframefromstring(inputstr):
         return pd.read_csv(pd.compat.StringIO(inputstr), sep='\s+')
@@ -141,6 +146,8 @@ if __name__ == "__main__":
         .withColumn("roles", getrolesonetime(df_edgeslist.edges)) \
         .select("model", "date", "roles").cache()
 
+    df_roles.write.parquet(output)
+
     # StructType(List(StructField(model, StringType, true), StructField(date, DateType, true),
     #                 StructField(roles, StringType, true)))
     # df_roles.schema
@@ -170,9 +177,9 @@ if __name__ == "__main__":
 
     @udf(returnType=StringType())
     def gettransition(model, date, roles):
-        dates = getdatesfrombaselist()
+        base_dates = getdatesfrombaselist()
         reg = pd.DataFrame()
-        if date - timedelta(windows - 1) in dates:  # make sure include enought data to get transition
+        if date - timedelta(windows - 1) in base_dates:  # make sure include enought data to get transition
             if model == "base":
                 for k in range(windows):
                     weight = math.pow(alpha, k) if k == 9 else (1 - alpha) * math.pow(alpha, k)
@@ -183,7 +190,7 @@ if __name__ == "__main__":
                     else:
                         role = getdataframefromstring(role_str)  # Dataframe
                         reg = reg.add(role * weight, fill_value=0).fillna(0)
-                return None if reg is None else reg.to_string()
+                return None if reg.empty else reg.to_string()
             else:
                 return roles
         else:
@@ -207,8 +214,9 @@ if __name__ == "__main__":
     # | -- roles: string(nullable=true)
     # | -- transition: string(nullable=true)
     # The formal paramter of an UDF must be an object with type of str or col in spark
-    df_transition = df_roles.withColumn("transition",
-                                        gettransition(df_roles.model, df_roles.date, df_roles.roles)).dropna()
+    df_transition = df_roles\
+        .withColumn("transition", gettransition(df_roles.model, df_roles.date, df_roles.roles))\
+        .dropna()
 
 
     @udf(returnType=StringType())
@@ -216,7 +224,7 @@ if __name__ == "__main__":
         if model == 'base':
             role_df = getdataframefromstring(role)  # dataframe
             transition_df = getdataframefromstring(transition)  # dataframe
-            prediction = role_df.multiply(transition_df).fillna(0)
+            prediction = role_df.multiply(transition_df, fill_value=0).fillna(0)
             return prediction.to_string()
         else:
             return role
@@ -228,16 +236,15 @@ if __name__ == "__main__":
     # | -- roles: string(nullable=true)
     # | -- transition: string(nullable=true)
     # | -- prediction: string(nullable=true)
-    df_prediction = df_transition.withColumn("prediction",
-                                             getprediction(df_transition.model, df_transition.roles,
-                                                           df_transition.transition))
+    df_prediction = df_transition\
+        .withColumn("prediction", getprediction(df_transition.model, df_transition.roles, df_transition.transition))
 
 
     @udf(returnType=FloatType())
     def getfrobeniousloss(model, date, pred):
-        dates = getdatesfrombaselist()
+        base_dates = getdatesfrombaselist()
         pre_date = date + timedelta(1)  # predict next day graph
-        if pre_date in dates:
+        if pre_date in base_dates:
             base_str = getrolestrfrombaselist(pre_date)
             if base_str is None:
                 print(f"[*dynamgraph*]\treturn baseline role is np.nan: {date}:{pre_date}, model: {model}")
@@ -261,7 +268,8 @@ if __name__ == "__main__":
     # | -- prediction: string(nullable=true)
     # | -- loss: float(nullable=true)
     df_loss = df_prediction \
-        .withColumn('loss', getfrobeniousloss(df_prediction.model, df_prediction.date, df_prediction.prediction))
+        .withColumn('loss', getfrobeniousloss(df_prediction.model, df_prediction.date, df_prediction.prediction))\
+        .dropna()
 
     shapeschema = StructType([
         StructField("nrow", IntegerType(), True),
@@ -297,8 +305,8 @@ if __name__ == "__main__":
 
     # nrow = df_reg.first().__getitem__('roles_ndim').__getitem__('nrow')
 
-
     print(f"[*dynamgraph*]\tmodel\tdate\troles_ndim\ttrans_ndim\tpredi_ndim\tloss\n")
+
     for row in df_reg.select('model', 'date', 'roles_ndim', 'trans_ndim', 'predi_ndim', 'loss').collect(): # Array[Row]
         model = row.__getitem__('model')
         date = row.__getitem__('date')
